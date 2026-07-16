@@ -1,13 +1,12 @@
 Package: missForest
 Type: Package
 Title: Nonparametric Missing Value Imputation using Random Forest
-Version: 1.6
-Date: 2025-10-13
-Authors@R: 
-    c(person(given = c("Daniel","J."),
+Version: 1.6.1
+Date: 2025-10-22
+Authors@R: person(given = c("Daniel","J."),
              family = "Stekhoven",
              role = c("aut","cre"),
-             email = "stekhoven@nexus.ethz.ch"))
+             email = "stekhoven@nexus.ethz.ch")
 Maintainer: Daniel J. Stekhoven <stekhoven@nexus.ethz.ch>
 Imports: 
     randomForest,

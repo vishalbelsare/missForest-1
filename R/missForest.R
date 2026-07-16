@@ -157,8 +157,13 @@ missForest <- function(xmis,
   ## variable parallelization indices
   nzsort.j <- sort.j[sort.noNAvar > 0]
   if (parallelize == 'variables') {
-    `%cols%` <- doRNG::`%dorng%`
-    idxList <- as.list(isplitVector(nzsort.j, chunkSize = foreach::getDoParWorkers()))
+    if (length(nzsort.j) == 0L) {
+      # nothing to impute – avoid empty foreach loop
+      parallelize <- 'no'
+    } else {
+      `%cols%` <- doRNG::`%dorng%`
+      idxList <- as.list(isplitVector(nzsort.j, chunkSize = foreach::getDoParWorkers()))
+    }
   }
 
   ## outputs and convergence trackers
@@ -210,17 +215,39 @@ missForest <- function(xmis,
     
     if (parallelize == 'variables') {
       for (idx in idxList) {
-        results <- foreach::foreach(varInd = idx,
-                                    .packages = if (backend == 'ranger')
+        
+        # skip empty chunks defensively
+        if (length(idx) == 0L) next
+        
+        # run workers; never let an error drop 'results' entirely
+        results <- tryCatch(
+          foreach::foreach(
+            varInd = idx, 
+            .packages = if (backend == 'ranger')
                                       'ranger'
                                     else
                                       'randomForest') %cols% {
                                         obsi <- !NAloc[, varInd]
                                         misi <- NAloc[, varInd]
                                         obsY <- ximp[obsi, varInd]
-                                        obsX <- ximp[obsi, seq_len(p)[-varInd]]
-                                        misX <- ximp[misi, seq_len(p)[-varInd]]
+                                        obsX <- ximp[obsi, seq_len(p)[-varInd], drop = FALSE]
+                                        misX <- ximp[misi, seq_len(p)[-varInd], drop = FALSE]
                                         typeY <- varType[varInd]
+                                        
+                                        # zero-covariate fallback
+                                        if (ncol(obsX) == 0L) {
+                                          if (typeY == 'numeric') {
+                                            misY <- rep(mean(obsY, na.rm = TRUE), sum(misi))
+                                            oerr <- 0
+                                          } else {
+                                            obsYf <- factor(obsY)
+                                            tab <- table(obsYf)
+                                            mode_class <- names(tab)[which.max(tab)]
+                                            misY <- factor(rep(mode_class, sum(misi)), levels = levels(obsYf))
+                                            oerr <- 0
+                                          }
+                                          return(list(varInd = varInd, misY = misY, oerr = oerr))
+                                        }
                                         
                                         if (backend == 'ranger') {
                                           ## ranger path
@@ -246,26 +273,21 @@ missForest <- function(xmis,
                                                 replace,
                                               sample.fraction = sf,
                                               min.bucket = if (!is.null(nodesize))
-                                                nodesize[1]
-                                              else
-                                                5,
-                                              write.forest =
-                                                TRUE,
+                                                nodesize[1] else 5,
+                                              write.forest = TRUE,
                                               oob.error = TRUE,
                                               num.threads = 1,
-                                              verbose =
-                                                FALSE
+                                              verbose = FALSE
                                             )
                                             oerr <- RF$prediction.error
                                             misY <- predict(RF, data = misX)$predictions
                                           } else {
                                             obsY <- factor(obsY)
                                             summarY <- summary(obsY)
-                                            if (length(summarY) == 1) {
+                                            if (length(summarY) == 1L) {
                                               oerr <- 0
                                               misY <- factor(rep(names(summarY), sum(misi)))
-                                            }
-                                            else {
+                                            } else {
                                               use_prob <- !is.null(cutoff) && !is.null(cutoff[[varInd]])
                                               RF <- ranger::ranger(
                                                 x = obsX,
@@ -279,16 +301,12 @@ missForest <- function(xmis,
                                                 else
                                                   NULL,
                                                 min.bucket = if (!is.null(nodesize))
-                                                  nodesize[2]
-                                                else
-                                                  1,
-                                                # or 1 if you choose that default
+                                                  nodesize[2] else 1,
                                                 write.forest = TRUE,
                                                 oob.error = TRUE,
                                                 probability = use_prob,
                                                 respect.unordered.factors = "order",
                                                 num.threads = 1,
-                                                # avoid nested parallelism in variables-mode
                                                 verbose = FALSE
                                               )
                                               
@@ -385,23 +403,22 @@ missForest <- function(xmis,
                                             }
                                           }
                                         }
-                                        list(varInd = varInd,
-                                             misY = misY,
-                                             oerr = oerr)
-                                      }
-        for (res in results) {
-          misi <- NAloc[, res$varInd]
-          ximp[misi, res$varInd] <- res$misY
-          OOBerror[res$varInd] <- res$oerr
+                                        list(varInd = varInd, misY = misY, oerr = oerr)
+                                      },
+          error = function(e) list() # safe fallback
+        )
+        
+        # apply results in the main process
+        if (length(results)) {
+          for (res in results) {
+            if (is.null(res) || is.null(res$varInd)) next
+            misi <- NAloc[, res$varInd]
+            ximp[misi, res$varInd] <- res$misY
+            OOBerror[res$varInd] <- res$oerr
+          }
         }
-        list(varInd = varInd, misY = misY, oerr = oerr)
       }
-      ## update the master copy of the data
-      for (res in results) {
-        misi <- NAloc[,res$varInd]
-        ximp[misi, res$varInd] <- res$misY
-        OOBerror[res$varInd] <- res$oerr
-      }
+       
     } else {
       ## sequential across variables, optional forest-level parallel
       for (s in 1:p) {
@@ -411,9 +428,25 @@ missForest <- function(xmis,
         obsi <- !NAloc[, varInd]
         misi <- NAloc[, varInd]
         obsY <- ximp[obsi, varInd]
-        obsX <- ximp[obsi, seq_len(p)[-varInd]]
-        misX <- ximp[misi, seq_len(p)[-varInd]]
+        obsX <- ximp[obsi, seq_len(p)[-varInd], drop = FALSE]
+        misX <- ximp[misi, seq_len(p)[-varInd], drop = FALSE]
         typeY <- varType[varInd]
+        
+        # zero-covariate fallback
+        if (ncol(obsX) == 0L) {
+          if (typeY == 'numeric') {
+            misY <- rep(mean(obsY, na.rm = TRUE), sum(misi))
+            OOBerror[varInd] <- 0
+          } else {
+            obsYf <- factor(obsY)
+            tab <- table(obsYf)
+            mode_class <- names(tab)[which.max(tab)]
+            misY <- factor(rep(mode_class, sum(misi)), levels = levels(obsYf))
+            OOBerror[varInd] <- 0
+          }
+          ximp[misi, varInd] <- misY
+          next
+        }
         
         if (backend == 'ranger') {
           sf <- .sample_fraction(
